@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path"
 	"sync"
+	"syscall"
 
 	"github.com/abligh/gonbdserver/nbd"
 	"github.com/aws/aws-sdk-go/aws"
@@ -15,17 +17,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/ebs"
 )
 
-var flags = flag.NewFlagSet("", flag.ExitOnError)
 var region string
 var socket string
 
-func usage() {
-	fmt.Fprintf(flags.Output(), "usage: %s [flags] snap-12345678\n", os.Args[0])
-	flags.PrintDefaults()
-	os.Exit(2)
-}
-
-func init() {
+func main() {
 	defaultRegion, ok := os.LookupEnv("AWS_REGION")
 	if !ok {
 		defaultRegion = "us-east-1"
@@ -37,20 +32,24 @@ func init() {
 	}
 	defaultSocket := path.Join(defaultSocketDir, "nbd.sock")
 
-	flags.StringVar(&region, "region", defaultRegion, "AWS region of snapshot")
-	flags.StringVar(&socket, "socket", defaultSocket, "path to listen on")
+	flag.StringVar(&region, "region", defaultRegion, "AWS region of snapshot")
+	flag.StringVar(&socket, "socket", defaultSocket, "path to listen on")
 
-	flags.Usage = usage
-}
-
-func main() {
-	flags.Parse(os.Args)
-
-	args := flags.Args()
-	if len(args) != 2 {
-		usage()
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  %s [flags] <required_unnamed_arg>\n\n", os.Args[0])
+		fmt.Fprintln(flag.CommandLine.Output(), "Flags:")
+		flag.PrintDefaults() // Prints defined flags like -model automatically
 	}
-	snapshot := args[1]
+
+	flag.Parse()
+	if flag.NArg() != 1 {
+		flag.Usage()
+		return
+	}
+
+	args := flag.Args()
+	snapshot := args[0]
 
 	sess := session.Must(session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -60,8 +59,6 @@ func main() {
 	nbd.RegisterBackend("ebs", func(ctx context.Context, e *nbd.ExportConfig) (nbd.Backend, error) {
 		return NewSnapshotBackend(ctx, client, snapshot)
 	})
-
-	os.Remove(socket)
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	var sessionWaitGroup sync.WaitGroup
@@ -85,5 +82,17 @@ func main() {
 		})
 	}()
 
-	<-ctx.Done()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+		case <-ctx.Done():
+		case <-sigChan:
+	}
+
+	fmt.Printf("\nStarting graceful shutdown...\n")
+	if err := os.RemoveAll(socket); err != nil {
+		fmt.Printf("Error socket file: %v\n", err)
+		return
+	}
 }
